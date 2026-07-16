@@ -1,5 +1,9 @@
 """
-scraper.py — поиск Telegram-каналов по ключевым словам через tgsearch.org
+tg_scraper.py — поиск Telegram-каналов и чатов через tgsearch.org
+
+tgsearch.org отдаёт каналы и чаты в одной выдаче. Тип определяется
+по текстовым признакам (слова "чат", "группа", "group" и т.п.
+в названии/описании) — точного поля "тип" в HTML нет.
 """
 
 import logging
@@ -20,14 +24,22 @@ HEADERS = {
     "Accept-Language": "ru-RU,ru;q=0.9",
 }
 
+# Слова-маркеры, по которым определяем что это чат/группа, а не канал
+CHAT_MARKERS = [
+    "чат", "chat", "группа", "group", "групп",
+    "обсужден", "флуд", "болталк", "общение", "коммьюнити",
+    "community", "форум", "forum",
+]
+
 
 @dataclass
-class ChannelResult:
+class TGChannel:
     name: str
     username: str
     subscribers: int
     description: str
     category: str = ""
+    entry_type: str = "channel"   # "channel" или "chat"
 
     def tg_link(self) -> str:
         return f"https://t.me/{self.username.lstrip('@')}"
@@ -38,6 +50,12 @@ class ChannelResult:
         if self.subscribers >= 1_000:
             return f"{self.subscribers / 1_000:.1f}K"
         return str(self.subscribers)
+
+    def type_emoji(self) -> str:
+        return "💬" if self.entry_type == "chat" else "📢"
+
+    def type_label(self) -> str:
+        return "Чат" if self.entry_type == "chat" else "Канал"
 
 
 def _parse_subscribers(text: str) -> int:
@@ -53,7 +71,16 @@ def _parse_subscribers(text: str) -> int:
         return 0
 
 
-def _parse_page(html: str) -> list[ChannelResult]:
+def _detect_type(name: str, description: str) -> str:
+    """Определяем канал это или чат по ключевым словам в названии/описании."""
+    text = f"{name} {description}".lower()
+    for marker in CHAT_MARKERS:
+        if marker in text:
+            return "chat"
+    return "channel"
+
+
+def _parse_page(html: str) -> list[TGChannel]:
     soup = BeautifulSoup(html, "html.parser")
     results = []
 
@@ -69,7 +96,6 @@ def _parse_page(html: str) -> list[ChannelResult]:
 
             block_text = parent.get_text(separator="\n", strip=True)
 
-            # Username
             username = ""
             for a in parent.find_all("a", href=True):
                 if "t.me/" in a["href"]:
@@ -84,19 +110,16 @@ def _parse_page(html: str) -> list[ChannelResult]:
             if not username:
                 continue
 
-            # Подписчики
             subs = 0
             m = re.search(r"([\d]+[.,]?[\d]*\s*[KkМMмm])", block_text)
             if m:
                 subs = _parse_subscribers(m.group(1))
 
-            # Описание
             desc = ""
             p = parent.find("p")
             if p:
                 desc = p.get_text(strip=True)[:200]
 
-            # Категория
             cat = ""
             for a in parent.find_all("a", href=re.compile(r"query=")):
                 t = a.get_text(strip=True)
@@ -104,12 +127,15 @@ def _parse_page(html: str) -> list[ChannelResult]:
                     cat = t
                     break
 
-            results.append(ChannelResult(
+            entry_type = _detect_type(name, desc)
+
+            results.append(TGChannel(
                 name=name,
                 username=username,
                 subscribers=subs,
                 description=desc,
                 category=cat,
+                entry_type=entry_type,
             ))
         except Exception as e:
             logger.debug(f"Ошибка карточки: {e}")
@@ -117,29 +143,34 @@ def _parse_page(html: str) -> list[ChannelResult]:
     return results
 
 
-def _fetch(query: str, page: int = 1) -> list[ChannelResult]:
+def _fetch(query: str, page: int = 1) -> list[TGChannel]:
     url = f"https://tgsearch.org/search?query={query}&page={page}"
     try:
         resp = httpx.get(url, headers=HEADERS, timeout=15, follow_redirects=True)
         if resp.status_code != 200:
             return []
         items = _parse_page(resp.text)
-        logger.info(f"[tgsearch] '{query}' стр.{page}: {len(items)}")
+        logger.info(f"[TG] '{query}' стр.{page}: {len(items)}")
         return items
     except Exception as e:
-        logger.error(f"[tgsearch] '{query}': {e}")
+        logger.error(f"[TG] '{query}': {e}")
         return []
 
 
-def search_channels(query: str, max_results: int = 30) -> list[ChannelResult]:
+def search_tg_channels(
+    query: str,
+    max_results: int = 30,
+    only_type: str = "all",   # "all" / "channel" / "chat"
+) -> list[TGChannel]:
     """
-    Ищем каналы по ключевому слову пользователя.
-    Парсим 8 страниц, фильтруем по подписчикам.
+    Поиск каналов и чатов по ключевому слову.
+    only_type фильтрует: "channel" — только каналы, "chat" — только чаты,
+    "all" — всё вместе (с пометками 📢/💬).
     """
-    all_results: list[ChannelResult] = []
+    all_results: list[TGChannel] = []
     seen: set[str] = set()
 
-    for page in range(1, 9):  # 8 страниц
+    for page in range(1, 9):
         items = _fetch(query, page)
         if not items:
             break
@@ -149,14 +180,15 @@ def search_channels(query: str, max_results: int = 30) -> list[ChannelResult]:
                 seen.add(key)
                 all_results.append(ch)
 
-    # Фильтр по подписчикам
     filtered = [
         ch for ch in all_results
         if ch.subscribers >= MIN_SUBSCRIBERS
         and "+" not in ch.username
     ]
 
-    filtered.sort(key=lambda x: x.subscribers, reverse=True)
+    if only_type in ("channel", "chat"):
+        filtered = [ch for ch in filtered if ch.entry_type == only_type]
 
-    logger.info(f"'{query}': {len(all_results)} найдено → {len(filtered)} после фильтра")
+    filtered.sort(key=lambda x: x.subscribers, reverse=True)
     return filtered[:max_results]
+
